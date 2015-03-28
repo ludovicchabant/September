@@ -19,6 +19,10 @@ By default, this will clone your repository into a temporary directory (which
 you can override with the `--tmp-dir` argument), update back to every tag, and
 run `foo bar` each time at the root of the clone.
 
+If you already ran September previously, however, it will only run the command
+on any new/changed tag. You can see what September remembers by using the
+`--status` argument.
+
 September will guess what kind of repository you're giving it, and do the
 appropriate things to clone and update it. Right now Git and Mercurial are
 supported.
