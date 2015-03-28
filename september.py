@@ -4,7 +4,9 @@ import sys
 import json
 import os.path
 import logging
+import hashlib
 import argparse
+import tempfile
 import subprocess
 import configparser
 from urllib.parse import urlparse
@@ -17,7 +19,7 @@ class IRepo(object):
     def clone(self, repo_url, repo_path):
         raise NotImplementedError()
 
-    def pull(self, repo_path):
+    def pull(self, repo_path, remote):
         raise NotImplementedError()
 
     def getTags(self, repo_path):
@@ -31,11 +33,13 @@ class GitRepo(object):
     def clone(self, repo_url, repo_path):
         subprocess.check_call(['git', 'clone', repo_url, repo_path])
 
-    def pull(self, repo_path):
-        subprocess.check_call(['git', 'pull', 'origin', 'master'])
+    def pull(self, repo_path, remote):
+        subprocess.check_call(['git', '-C', repo_path,
+                               'pull', remote, 'master'])
 
     def getTags(self, repo_path):
-        output = subprocess.check_output(['git', 'show-ref', '--tags'])
+        output = subprocess.check_output(['git', '-C', repo_path,
+                                          'show-ref', '--tags'])
         pat = re.compile(r'^(?P<id>[0-9a-f]+) (?P<tag>.+)$')
         for line in output.split('\n'):
             m = pat.match(line)
@@ -44,20 +48,21 @@ class GitRepo(object):
 
     def update(self, repo_path, rev_id):
         rev_id = rev_id or 'master'
-        subprocess.check_call(['git', 'checkout', rev_id])
+        subprocess.check_call(['git', '-C', repo_path, 'checkout', rev_id])
 
 
 class MercurialRepo(object):
     def clone(self, repo_url, repo_path):
         subprocess.check_call(['hg', 'clone', repo_url, repo_path])
 
-    def pull(self, repo_path):
-        subprocess.check_call(['hg', 'pull'],
+    def pull(self, repo_path, remote):
+        subprocess.check_call(['hg', '-R', repo_path, 'pull', remote],
                               stderr=subprocess.STDOUT)
 
     def getTags(self, repo_path):
         output = subprocess.check_output(
-                'hg log -r "tag()" --template "{tags} {node}\\n"',
+                ('hg -R "' + repo_path +
+                    '" log -r "tag()" --template "{tags} {node}\\n"'),
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 shell=True)
@@ -69,7 +74,7 @@ class MercurialRepo(object):
 
     def update(self, repo_path, rev_id):
         rev_id = rev_id or 'default'
-        subprocess.check_call(['hg', 'update', rev_id],
+        subprocess.check_call(['hg', '-R', repo_path, 'update', rev_id],
                               stderr=subprocess.STDOUT)
 
 
@@ -105,6 +110,7 @@ def main():
                          "something in the background."))
     parser.add_argument(
             'repo',
+            nargs='?',
             help="The repository to observe and process")
     parser.add_argument(
             '-t', '--tmp-dir',
@@ -120,12 +126,24 @@ def main():
     parser.add_argument(
             '--command',
             help="The command to run on each tag.")
+    parser.add_argument(
+            '--scan-only',
+            action='store_true',
+            help=("Only scan the repository history. Don't update or run the "
+                  "command"))
+    parser.add_argument(
+            '--status',
+            action='store_true',
+            help="See September's status for the given repository.")
 
-    # Parse arguments, guess repo type.
+    # Parse arguments.
     res = parser.parse_args()
+    repo_dir = res.repo or os.getcwd()
+
+    # Guess the repo type.
     repo_type = res.scm
     if not repo_type or repo_type == 'guess':
-        repo_type = guess_repo_type(res.repo)
+        repo_type = guess_repo_type(repo_dir)
         if not repo_type:
             logger.error("Can't guess the repository type. Please use the "
                          "--scm option to specify it.")
@@ -134,33 +152,21 @@ def main():
             logger.error("Unknown repository type: %s" % repo_type)
             sys.exit(1)
 
-    # Create the repo handler.
-    repo = repo_class[repo_type]()
-
-    # Clone or update/checkout the repository in the temp directory.
-    clone_dir = os.path.join(res.tmp_dir, 'clone')
-    if not os.path.exists(clone_dir):
-        logger.info("Cloning '%s' into: %s" % (res.repo, clone_dir))
-        repo.clone(res.repo, clone_dir)
-    else:
-        os.chdir(clone_dir)
-        logger.info("Pulling changes from '%s'." % res.repo)
-        repo.update(res.repo, None)
-
-    os.chdir(clone_dir)
-
-    # Find the configuration file in the repository clone.
-    config_file = res.config or os.path.join(clone_dir, '.september.yml')
+    # Find the configuration file.
+    config_file = res.config or os.path.join(repo_dir, '.september.cfg')
     config = configparser.ConfigParser(interpolation=None)
     if os.path.exists(config_file):
         logger.info("Loading configuration file: %s" % config_file)
         config.read(config_file)
 
+    # Validate the configuration.
     if not config.has_section('september'):
         config.add_section('september')
     config_sec = config['september']
     if res.command:
         config_sec['command'] = res.command
+    if res.tmp_dir:
+        config_sec['tmp_dir'] = res.tmp_dir
 
     if not config.has_option('september', 'command'):
         logger.error("There is no 'command' configuration setting under the "
@@ -168,13 +174,32 @@ def main():
                      "option.")
         sys.exit(1)
 
+    # Get the temp dir.
+    tmp_dir = config_sec.get('tmp_dir', None)
+    if not tmp_dir:
+        tmp_name = 'september_%s' % hashlib.md5(
+                repo_dir.encode('utf8')).hexdigest()
+        tmp_dir = os.path.join(tempfile.gettempdir(), tmp_name)
+
     # Find the cache file in the temp directory.
-    cache_file = os.path.join(res.tmp_dir, 'september.json')
+    cache_file = os.path.join(tmp_dir, 'september.json')
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as fp:
             cache = json.load(fp)
     else:
         cache = {'tags': {}}
+
+    # See if we just need to show the status:
+    if res.status:
+        logger.info("Status for '%s':" % repo_dir)
+        for t, v in cache['tags'].items():
+            logger.info("- %s" % t)
+            logger.info("    commit ID  : %s" % v['id'])
+            logger.info("    processed? : %s" % v['processed'])
+        return
+
+    # Create the repo handler.
+    repo = repo_class[repo_type]()
 
     # Update the cache: get any new/moved tags.
     first_tag = config_sec.get('first_tag', None)
@@ -183,9 +208,19 @@ def main():
     if tag_pattern:
         tag_re = re.compile(tag_pattern)
 
+    reached_first_tag = not bool(first_tag)
     previous_tags = cache['tags']
-    tags = repo.getTags(clone_dir)
+    tags = repo.getTags(repo_dir)
     for t, i in tags:
+        if not reached_first_tag and first_tag == t:
+            reached_first_tag = True
+
+        if not reached_first_tag:
+            if t in previous_tags:
+                logger.info("Removing tag '%s'." % t)
+                del previous_tags[t]
+            continue
+
         if not tag_re or tag_re.search(t):
             if t not in previous_tags:
                 logger.info("Adding tag '%s'." % t)
@@ -194,12 +229,22 @@ def main():
                 logger.info("Moving tag '%s'." % t)
                 previous_tags[t] = {'id': i, 'processed': False}
 
-        if first_tag and first_tag == t:
-            break
-
     logger.info("Updating cache file '%s'." % cache_file)
     with open(cache_file, 'w') as fp:
         json.dump(cache, fp)
+
+    if res.scan_only:
+        return
+
+    # Clone or update/checkout the repository in the temp directory.
+    clone_dir = os.path.join(tmp_dir, 'clone')
+    if not os.path.exists(clone_dir):
+        logger.info("Cloning '%s' into: %s" % (repo_dir, clone_dir))
+        repo.clone(repo_dir, clone_dir)
+    else:
+        logger.info("Pulling changes from '%s'." % repo_dir)
+        repo.pull(clone_dir, repo_dir)
+        repo.update(clone_dir, None)
 
     # Process tags!
     use_shell = config_sec.get('use_shell') in ['1', 'yes', 'true']
